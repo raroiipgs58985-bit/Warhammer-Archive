@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "warhammer-archive"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local-first PDF library auditor and research assistant foundation"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,4 +17,3 @@ warhammer-archive = "warhammer_archive.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

@@ -19,9 +19,15 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     audit = commands.add_parser(
         "audit",
-        help="Проверить PDF-библиотеку без изменения исходных файлов",
+        help=(
+            "Проверить PDF-библиотеку без изменения исходных файлов"
+        ),
     )
-    audit.add_argument("library", type=Path, help="Корневая папка библиотеки")
+    audit.add_argument(
+        "library",
+        type=Path,
+        help="Корневая папка библиотеки",
+    )
     audit.add_argument(
         "--output",
         type=Path,
@@ -32,12 +38,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-text-chars",
         type=int,
         default=80,
-        help="Минимум непробельных символов для текстовой страницы",
+        help=(
+            "Минимум непробельных символов для текстовой страницы"
+        ),
     )
     audit.add_argument(
         "--quiet",
         action="store_true",
         help="Не показывать прогресс по каждому файлу",
+    )
+    audit.add_argument(
+        "--full-rescan",
+        action="store_true",
+        help=(
+            "Повторно проанализировать все PDF, "
+            "игнорируя сохранённый результат"
+        ),
     )
     return parser
 
@@ -57,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         library_root=args.library,
         output_dir=args.output,
         min_text_chars=args.min_text_chars,
+        full_rescan=args.full_rescan,
     )
 
     try:
@@ -71,4 +88,3 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(summary["files"], ensure_ascii=False, indent=2))
     print(f"Отчёт сохранён: {Path(summary['output_dir']) / 'summary.json'}")
     return 0
-
