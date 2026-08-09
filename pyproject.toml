@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "warhammer-archive"
+version = "0.1.0"
+description = "Local-first PDF library auditor and research assistant foundation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PyMuPDF>=1.24,<2",
+]
+
+[project.scripts]
+warhammer-archive = "warhammer_archive.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

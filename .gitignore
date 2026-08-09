@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local settings and secrets
+.env
+.env.*
+!.env.example
+config.local.*
+
+# User-owned libraries and generated data
+/library/
+/user_data/
+/data/
+/models/
+/indexes/
+/cache/
+/reports/
+/audit-report/
+*.sqlite
+*.sqlite3
+*.db
+
+# Source books and model weights must never enter Git history
+*.pdf
+*.epub
+*.mobi
+*.djvu
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.bin
+
