@@ -17,6 +17,11 @@ from .catalog import Catalog, utc_now
 REPORT_SCHEMA_VERSION = "1.1"
 ANALYZER_VERSION = "1.1"
 ProgressCallback = Callable[[int, int, str, str], None]
+CancelCallback = Callable[[], bool]
+
+
+class AuditCancelled(RuntimeError):
+    """Raised after a cooperative cancellation request between PDF files."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -537,6 +542,7 @@ def _build_summary(
 def audit_library(
     config: AuditConfig,
     progress: ProgressCallback | None = None,
+    cancel_requested: CancelCallback | None = None,
 ) -> dict[str, Any]:
     config = config.validated()
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -552,6 +558,10 @@ def audit_library(
 
         try:
             for index, path in enumerate(pdf_files, start=1):
+                if cancel_requested is not None and cancel_requested():
+                    raise AuditCancelled(
+                        "Аудит остановлен после завершения предыдущего файла"
+                    )
                 relative_path = path.relative_to(config.library_root).as_posix()
                 try:
                     total_bytes += path.stat().st_size
@@ -601,6 +611,14 @@ def audit_library(
             _atomic_write_json(config.output_dir / "summary.json", summary)
             catalog.finish_run(run_id, dict(counters))
             return summary
+        except AuditCancelled as error:
+            catalog.finish_run(
+                run_id,
+                dict(counters),
+                status="cancelled",
+                error=str(error),
+            )
+            raise
         except KeyboardInterrupt as error:
             catalog.finish_run(
                 run_id,
