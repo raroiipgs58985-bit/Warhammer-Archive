@@ -6,14 +6,16 @@ import os
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pymupdf
 
+from .catalog import Catalog, utc_now
 
-SCHEMA_VERSION = "1.0"
+
+REPORT_SCHEMA_VERSION = "1.1"
+ANALYZER_VERSION = "1.1"
 ProgressCallback = Callable[[int, int, str, str], None]
 
 
@@ -22,6 +24,7 @@ class AuditConfig:
     library_root: Path
     output_dir: Path
     min_text_chars: int = 80
+    full_rescan: bool = False
 
     def validated(self) -> "AuditConfig":
         root = self.library_root.expanduser().resolve()
@@ -30,7 +33,9 @@ class AuditConfig:
         if not root.exists():
             raise ValueError(f"Папка библиотеки не найдена: {root}")
         if not root.is_dir():
-            raise ValueError(f"Путь библиотеки не является папкой: {root}")
+            raise ValueError(
+                f"Путь библиотеки не является папкой: {root}"
+            )
         if self.min_text_chars < 1:
             raise ValueError("min_text_chars должен быть больше нуля")
 
@@ -38,6 +43,7 @@ class AuditConfig:
             library_root=root,
             output_dir=output,
             min_text_chars=self.min_text_chars,
+            full_rescan=self.full_rescan,
         )
 
 
@@ -167,7 +173,7 @@ def inspect_pdf(
     except Exception as error:
         result.update(
             status="unreadable",
-            error=f"{type(error).__name__}: {error}",
+            error=_error_text(error),
             page_count=0,
             document_kind="unreadable",
             page_kind_counts={},
@@ -222,7 +228,7 @@ def inspect_pdf(
                     "pdf_page": page_index + 1,
                     "printed_label": str(page_index + 1),
                     "kind": kind,
-                    "error": f"{type(error).__name__}: {error}",
+                    "error": _error_text(error),
                 }
 
             pages.append(page_record)
@@ -235,6 +241,204 @@ def inspect_pdf(
     return result
 
 
+def _error_text(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"
+
+
+def _analysis_key(min_text_chars: int) -> str:
+    return f"{ANALYZER_VERSION};min_text_chars={min_text_chars}"
+
+
+def _is_unchanged(
+    existing: Any,
+    size_bytes: int,
+    modified_time_ns: int,
+    full_rescan: bool,
+    analysis_key: str,
+) -> bool:
+    return bool(
+        not full_rescan
+        and existing is not None
+        and existing["processing_state"] == "complete"
+        and existing["content_id"] is not None
+        and existing["analyzer_version"] == analysis_key
+        and int(existing["size_bytes"]) == size_bytes
+        and int(existing["modified_time_ns"]) == modified_time_ns
+    )
+
+
+def _find_move_candidate(
+    catalog: Catalog,
+    library_id: int,
+    content_id: int,
+    library_root: Path,
+    new_relative_path: str,
+) -> Any | None:
+    for candidate in catalog.find_move_candidates(library_id, content_id):
+        if candidate["relative_path"] == new_relative_path:
+            continue
+        old_path = library_root / candidate["relative_path"]
+        if not candidate["is_present"] or not old_path.is_file():
+            return candidate
+    return None
+
+
+def _process_file(
+    catalog: Catalog,
+    library_id: int,
+    run_id: int,
+    config: AuditConfig,
+    path: Path,
+    analyzed_hashes: set[str],
+) -> str:
+    relative_path = path.relative_to(config.library_root).as_posix()
+    stat = path.stat()
+    size_bytes = stat.st_size
+    modified_time_ns = stat.st_mtime_ns
+    existing = catalog.get_document(library_id, relative_path)
+    analysis_key = _analysis_key(config.min_text_chars)
+
+    if _is_unchanged(
+        existing,
+        size_bytes=size_bytes,
+        modified_time_ns=modified_time_ns,
+        full_rescan=config.full_rescan,
+        analysis_key=analysis_key,
+    ):
+        catalog.mark_seen_unchanged(
+            document_id=int(existing["id"]),
+            run_id=run_id,
+            size_bytes=size_bytes,
+            modified_time_ns=modified_time_ns,
+        )
+        return "reused_unchanged"
+
+    document_id: int | None = None
+    if existing is not None:
+        document_id = catalog.mark_processing(
+            library_id=library_id,
+            relative_path=relative_path,
+            file_name=path.name,
+            size_bytes=size_bytes,
+            modified_time_ns=modified_time_ns,
+            run_id=run_id,
+        )
+
+    try:
+        file_hash = sha256_file(path)
+    except Exception as error:
+        catalog.mark_file_error(
+            library_id=library_id,
+            relative_path=relative_path,
+            file_name=path.name,
+            size_bytes=size_bytes,
+            modified_time_ns=modified_time_ns,
+            run_id=run_id,
+            error=_error_text(error),
+        )
+        return "error"
+
+    content = catalog.get_content_by_sha(file_hash)
+    moved = False
+
+    if document_id is None and content is not None:
+        candidate = _find_move_candidate(
+            catalog=catalog,
+            library_id=library_id,
+            content_id=int(content["id"]),
+            library_root=config.library_root,
+            new_relative_path=relative_path,
+        )
+        if candidate is not None:
+            document_id = int(candidate["id"])
+            catalog.move_document(
+                document_id=document_id,
+                relative_path=relative_path,
+                file_name=path.name,
+                size_bytes=size_bytes,
+                modified_time_ns=modified_time_ns,
+                run_id=run_id,
+            )
+            moved = True
+
+    if document_id is None:
+        document_id = catalog.mark_processing(
+            library_id=library_id,
+            relative_path=relative_path,
+            file_name=path.name,
+            size_bytes=size_bytes,
+            modified_time_ns=modified_time_ns,
+            run_id=run_id,
+        )
+
+    content_is_current = bool(
+        content is not None and content["analyzer_version"] == analysis_key
+    )
+    may_reuse_content = content_is_current and (
+        not config.full_rescan or file_hash in analyzed_hashes
+    )
+
+    if may_reuse_content:
+        content_id = int(content["id"])
+        catalog.attach_content(
+            document_id=document_id,
+            content_id=content_id,
+            run_id=run_id,
+            size_bytes=size_bytes,
+            modified_time_ns=modified_time_ns,
+        )
+        if moved:
+            return "moved"
+        if catalog.has_other_present_document(
+            library_id=library_id,
+            content_id=content_id,
+            document_id=document_id,
+            library_root=config.library_root,
+        ):
+            return "duplicate"
+        return "reused_content"
+
+    result = inspect_pdf(
+        path=path,
+        library_root=config.library_root,
+        file_hash=file_hash,
+        min_text_chars=config.min_text_chars,
+    )
+    final_stat = path.stat()
+    if (
+        final_stat.st_size != size_bytes
+        or final_stat.st_mtime_ns != modified_time_ns
+    ):
+        catalog.mark_file_error(
+            library_id=library_id,
+            relative_path=relative_path,
+            file_name=path.name,
+            size_bytes=final_stat.st_size,
+            modified_time_ns=final_stat.st_mtime_ns,
+            run_id=run_id,
+            error=(
+                "Файл изменился во время анализа; "
+                "он будет проверен повторно"
+            ),
+        )
+        return "changed_during_scan"
+
+    content_id = catalog.store_content(
+        file_hash=file_hash,
+        analyzer_version=analysis_key,
+        result=result,
+    )
+    catalog.attach_content(
+        document_id=document_id,
+        content_id=content_id,
+        run_id=run_id,
+        size_bytes=size_bytes,
+        modified_time_ns=modified_time_ns,
+    )
+    analyzed_hashes.add(file_hash)
+    return "moved_and_analyzed" if moved else "analyzed"
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     temp_path = path.with_suffix(path.suffix + ".tmp")
     with temp_path.open("w", encoding="utf-8", newline="\n") as target:
@@ -245,6 +449,91 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temp_path, path)
 
 
+def _atomic_write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="\n") as target:
+            for record in records:
+                target.write(
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                )
+                target.write("\n")
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _build_summary(
+    config: AuditConfig,
+    records: list[dict[str, Any]],
+    counters: Counter[str],
+    run_id: int,
+    total_bytes: int,
+    missing_count: int,
+) -> dict[str, Any]:
+    status_counts: Counter[str] = Counter()
+    document_kind_counts: Counter[str] = Counter()
+    page_kind_counts: Counter[str] = Counter()
+    unique_hashes: set[str] = set()
+    classified_hashes: set[str] = set()
+    pages_declared = 0
+    pages_classified = 0
+
+    for record in records:
+        status_counts[str(record.get("status", "unknown"))] += 1
+        document_kind_counts[str(record.get("document_kind", "unknown"))] += 1
+        pages_declared += int(record.get("page_count", 0))
+        file_hash = record.get("sha256")
+        if file_hash:
+            unique_hashes.add(str(file_hash))
+        if (
+            file_hash
+            and record.get("status") != "duplicate"
+            and file_hash not in classified_hashes
+        ):
+            counts = record.get("page_kind_counts", {})
+            page_kind_counts.update(counts)
+            pages_classified += sum(int(value) for value in counts.values())
+            classified_hashes.add(str(file_hash))
+
+    return {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "generated_at": utc_now(),
+        "library_root": str(config.library_root),
+        "output_dir": str(config.output_dir),
+        "settings": {
+            "min_text_chars": config.min_text_chars,
+            "full_rescan": config.full_rescan,
+            "analyzer_version": ANALYZER_VERSION,
+        },
+        "run": {
+            "id": run_id,
+            "counters": dict(sorted(counters.items())),
+        },
+        "files": {
+            "discovered": len(records),
+            "unique_by_sha256": len(unique_hashes),
+            "total_bytes": total_bytes,
+            "missing_from_library": missing_count,
+            "by_status": dict(sorted(status_counts.items())),
+            "by_document_kind": dict(sorted(document_kind_counts.items())),
+        },
+        "pages": {
+            "declared_including_duplicates": pages_declared,
+            "classified_unique_contents": pages_classified,
+            "by_kind_unique_contents": dict(sorted(page_kind_counts.items())),
+        },
+        "catalog": {"database": "catalog.sqlite"},
+        "reports": {
+            "documents": "documents.jsonl",
+            "summary": "summary.json",
+        },
+    }
+
+
 def audit_library(
     config: AuditConfig,
     progress: ProgressCallback | None = None,
@@ -252,117 +541,79 @@ def audit_library(
     config = config.validated()
     config.output_dir.mkdir(parents=True, exist_ok=True)
     pdf_files = list(iter_pdf_files(config.library_root))
-
-    documents_path = config.output_dir / "documents.jsonl"
-    documents_temp_path = config.output_dir / "documents.jsonl.tmp"
-    summary_path = config.output_dir / "summary.json"
-
-    status_counts: Counter[str] = Counter()
-    document_kind_counts: Counter[str] = Counter()
-    page_kind_counts: Counter[str] = Counter()
-    seen_hashes: dict[str, dict[str, Any]] = {}
+    catalog_path = config.output_dir / "catalog.sqlite"
+    counters: Counter[str] = Counter()
     total_bytes = 0
-    pages_declared = 0
-    pages_analyzed = 0
+    analyzed_hashes: set[str] = set()
 
-    try:
-        with documents_temp_path.open("w", encoding="utf-8", newline="\n") as target:
+    with Catalog(catalog_path) as catalog:
+        library_id = catalog.get_or_create_library(config.library_root)
+        run_id = catalog.start_run(library_id, config.full_rescan)
+
+        try:
             for index, path in enumerate(pdf_files, start=1):
                 relative_path = path.relative_to(config.library_root).as_posix()
                 try:
                     total_bytes += path.stat().st_size
-                    file_hash = sha256_file(path)
-                    first = seen_hashes.get(file_hash)
-
-                    if first is not None:
-                        result = {
-                            "relative_path": relative_path,
-                            "file_name": path.name,
-                            "size_bytes": path.stat().st_size,
-                            "modified_time_ns": path.stat().st_mtime_ns,
-                            "sha256": file_hash,
-                            "status": "duplicate",
-                            "duplicate_of": first["relative_path"],
-                            "page_count": first["page_count"],
-                            "document_kind": first["document_kind"],
-                            "page_kind_counts": first["page_kind_counts"],
-                            "pages": [],
-                            "analysis_reused": True,
-                        }
-                    else:
-                        result = inspect_pdf(
-                            path=path,
-                            library_root=config.library_root,
-                            file_hash=file_hash,
-                            min_text_chars=config.min_text_chars,
-                        )
-                        seen_hashes[file_hash] = {
-                            "relative_path": relative_path,
-                            "page_count": result.get("page_count", 0),
-                            "document_kind": result.get("document_kind", "unknown"),
-                            "page_kind_counts": result.get("page_kind_counts", {}),
-                        }
-                        pages_analyzed += sum(
-                            result.get("page_kind_counts", {}).values()
-                        )
-
-                    pages_declared += result.get("page_count", 0)
+                    outcome = _process_file(
+                        catalog=catalog,
+                        library_id=library_id,
+                        run_id=run_id,
+                        config=config,
+                        path=path,
+                        analyzed_hashes=analyzed_hashes,
+                    )
                 except Exception as error:
-                    result = {
-                        "relative_path": relative_path,
-                        "file_name": path.name,
-                        "status": "error",
-                        "error": f"{type(error).__name__}: {error}",
-                        "page_count": 0,
-                        "document_kind": "unreadable",
-                        "page_kind_counts": {},
-                        "pages": [],
-                    }
+                    try:
+                        stat = path.stat()
+                        size_bytes = stat.st_size
+                        modified_time_ns = stat.st_mtime_ns
+                    except OSError:
+                        size_bytes = 0
+                        modified_time_ns = 0
+                    catalog.mark_file_error(
+                        library_id=library_id,
+                        relative_path=relative_path,
+                        file_name=path.name,
+                        size_bytes=size_bytes,
+                        modified_time_ns=modified_time_ns,
+                        run_id=run_id,
+                        error=_error_text(error),
+                    )
+                    outcome = "error"
 
-                status = str(result.get("status", "unknown"))
-                document_kind = str(result.get("document_kind", "unknown"))
-                status_counts[status] += 1
-                document_kind_counts[document_kind] += 1
-
-                if status != "duplicate":
-                    page_kind_counts.update(result.get("page_kind_counts", {}))
-
-                target.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-                target.write("\n")
-
+                counters[outcome] += 1
                 if progress is not None:
-                    progress(index, len(pdf_files), relative_path, status)
+                    progress(index, len(pdf_files), relative_path, outcome)
 
-            target.flush()
-            os.fsync(target.fileno())
-
-        os.replace(documents_temp_path, documents_path)
-    except Exception:
-        documents_temp_path.unlink(missing_ok=True)
-        raise
-
-    summary = {
-        "schema_version": SCHEMA_VERSION,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "library_root": str(config.library_root),
-        "output_dir": str(config.output_dir),
-        "settings": {"min_text_chars": config.min_text_chars},
-        "files": {
-            "discovered": len(pdf_files),
-            "unique_by_sha256": len(seen_hashes),
-            "total_bytes": total_bytes,
-            "by_status": dict(sorted(status_counts.items())),
-            "by_document_kind": dict(sorted(document_kind_counts.items())),
-        },
-        "pages": {
-            "declared_including_duplicates": pages_declared,
-            "analyzed_unique_files": pages_analyzed,
-            "by_kind_unique_files": dict(sorted(page_kind_counts.items())),
-        },
-        "reports": {
-            "documents": documents_path.name,
-            "summary": summary_path.name,
-        },
-    }
-    _atomic_write_json(summary_path, summary)
-    return summary
+            newly_missing = catalog.finalize_presence(library_id, run_id)
+            counters["newly_missing"] += newly_missing
+            records = catalog.snapshot(library_id)
+            summary = _build_summary(
+                config=config,
+                records=records,
+                counters=counters,
+                run_id=run_id,
+                total_bytes=total_bytes,
+                missing_count=catalog.missing_count(library_id),
+            )
+            _atomic_write_jsonl(config.output_dir / "documents.jsonl", records)
+            _atomic_write_json(config.output_dir / "summary.json", summary)
+            catalog.finish_run(run_id, dict(counters))
+            return summary
+        except KeyboardInterrupt as error:
+            catalog.finish_run(
+                run_id,
+                dict(counters),
+                status="interrupted",
+                error=_error_text(error),
+            )
+            raise
+        except BaseException as error:
+            catalog.finish_run(
+                run_id,
+                dict(counters),
+                status="failed",
+                error=_error_text(error),
+            )
+            raise
