@@ -32,7 +32,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Warhammer-Archive-Windows-x64
-          path: dist/Warhammer-Archive-Windows-x64.zip
+          path: dist/Warhammer-Archive
           if-no-files-found: error
           retention-days: 14
       - name: Publish tagged release
@@ -45,4 +45,3 @@ jobs:
           "dist/Warhammer-Archive-Windows-x64.zip"
           --title "Warhammer Archive ${{ github.ref_name }}"
           --generate-notes
-
