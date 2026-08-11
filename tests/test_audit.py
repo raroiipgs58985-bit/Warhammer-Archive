@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pymupdf
 
 from warhammer_archive.audit import (
+    AuditCancelled,
     AuditConfig,
     audit_library,
     inspect_pdf,
@@ -293,6 +294,37 @@ class LibraryAuditTests(unittest.TestCase):
                 library_id = catalog.get_or_create_library(library)
                 statuses = [run["status"] for run in catalog.run_history(library_id)]
             self.assertIn("interrupted", statuses)
+
+    def test_cooperative_cancellation_stops_between_files_and_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            library = root / "library"
+            output = root / "report"
+            library.mkdir()
+            make_text_pdf(library / "a_done.pdf")
+            make_text_pdf(library / "b_waiting.pdf", "Waiting record. " * 30)
+            cancel = False
+
+            def progress(*_args) -> None:
+                nonlocal cancel
+                cancel = True
+
+            with self.assertRaises(AuditCancelled):
+                audit_library(
+                    AuditConfig(library, output),
+                    progress=progress,
+                    cancel_requested=lambda: cancel,
+                )
+
+            resumed = audit_library(AuditConfig(library, output))
+            self.assertEqual(
+                resumed["run"]["counters"]["reused_unchanged"], 1
+            )
+            self.assertEqual(resumed["run"]["counters"]["analyzed"], 1)
+            with Catalog(output / "catalog.sqlite") as catalog:
+                library_id = catalog.get_or_create_library(library)
+                statuses = [run["status"] for run in catalog.run_history(library_id)]
+            self.assertIn("cancelled", statuses)
 
     def test_iter_pdf_files_is_recursive_and_case_insensitive(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
