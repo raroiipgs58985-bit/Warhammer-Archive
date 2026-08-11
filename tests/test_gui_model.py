@@ -48,7 +48,7 @@ class GuiModelTests(unittest.TestCase):
 
             output = default_output_directory(library)
 
-            self.assertEqual(output.parent, library.parent)
+            self.assertEqual(output.parent, library.resolve().parent)
             self.assertEqual(output.name, "Warhammer Archive Data")
             self.assertNotEqual(output, library)
 
@@ -58,4 +58,3 @@ class GuiModelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
